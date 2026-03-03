@@ -2,6 +2,7 @@
 import logging
 
 from telegram.ext import ApplicationBuilder, MessageHandler, filters
+from telegram.request import HTTPXRequest
 
 import config
 from handlers.audio_handler import make_handler
@@ -23,7 +24,24 @@ def main() -> None:
         model=config.VNPT_MODEL,
     )
 
-    app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
+    # Configure HTTP client with extended timeouts for large file downloads
+    # read_timeout: time to wait for data chunks (critical for large files)
+    # connect_timeout: time to establish connection
+    # write_timeout: time to send data
+    # pool_timeout: time to get connection from pool
+    request = HTTPXRequest(
+        read_timeout=360.0,     # 6 minutes for reading large files
+        connect_timeout=30.0,   # 30 seconds to connect
+        write_timeout=30.0,     # 30 seconds to write
+        pool_timeout=10.0,      # 10 seconds for connection pool
+    )
+
+    app = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .build()
+    )
 
     audio_handler = make_handler(stt, llm, config.MEETING_GROUP_NAME)
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, audio_handler))

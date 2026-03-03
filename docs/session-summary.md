@@ -1,4 +1,4 @@
-# Session Summary — Transcript & Summary Quality Fixes
+# Session Summary — Transcript & Summary Quality Fixes + Timeout Configuration
 
 **Date:** 2026-03-03
 
@@ -16,6 +16,14 @@
 - **Root cause:** `reply_text` was called without `parse_mode`, so `**bold**` etc. appeared as raw asterisks.
 - **Fix:** Added `md_to_telegram_html()` converter (line-by-line, HTML-escape first → safe substitution) and sent with `parse_mode="HTML"`.
 
+### 4. Large Audio File Download Timeout (9+ MB files)
+- **Root cause:** Default HTTP timeouts were insufficient for downloading large audio files (9+ MB) from Telegram servers.
+- **Fix:** Configured custom HTTP timeouts in `ApplicationBuilder` via `HTTPXRequest`:
+  - `read_timeout: 360s` (6 minutes) — time to wait for data chunks when reading large files
+  - `connect_timeout: 30s` — time to establish connection
+  - `write_timeout: 30s` — time to send data
+  - `pool_timeout: 10s` — time to acquire connection from pool
+
 ## New Files
 
 | File | Purpose |
@@ -27,6 +35,7 @@
 
 | File | Changes |
 |------|---------|
+| `main.py` | Added `HTTPXRequest` import; configured custom HTTP timeouts (read_timeout=360s, connect_timeout=30s, write_timeout=30s, pool_timeout=10s); passed request to ApplicationBuilder |
 | `services/stt_service.py` | `_create_job` adds diarization; `_fetch_transcript` returns `(text, tokens)` tuple; prefers `text` field |
 | `handlers/audio_handler.py` | Unpacks `(transcript, tokens)`; sends styled HTML file; sends summary with `parse_mode="HTML"` |
 | `tests/test_stt_service.py` | Updated `TestFetchTranscript` for new tuple return type and text-field preference behavior |
@@ -38,6 +47,8 @@ Voice/Audio message
         │
         ▼
   Download to tmp file
+  (HTTPXRequest: read_timeout=360s, connect_timeout=30s,
+   write_timeout=30s, pool_timeout=10s)
         │
         ▼
   Soniox STT (async)
