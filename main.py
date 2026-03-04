@@ -24,16 +24,19 @@ def main() -> None:
         model=config.VNPT_MODEL,
     )
 
-    # Configure HTTP client with extended timeouts for large file downloads
+    # Configure HTTP client with extended timeouts and connection pooling
     # read_timeout: time to wait for data chunks (critical for large files)
+    #               Set to 10 min to accommodate 3 retries @ 3 min each
     # connect_timeout: time to establish connection
     # write_timeout: time to send data
     # pool_timeout: time to get connection from pool
+    # connection_pool_size: number of connections to keep in pool for reuse
     request = HTTPXRequest(
-        read_timeout=360.0,     # 6 minutes for reading large files
+        read_timeout=600.0,     # 10 minutes for reading large files with retries
         connect_timeout=30.0,   # 30 seconds to connect
         write_timeout=30.0,     # 30 seconds to write
         pool_timeout=10.0,      # 10 seconds for connection pool
+        connection_pool_size=4, # 1 primary + 3 for retries/concurrent operations
     )
 
     app = (

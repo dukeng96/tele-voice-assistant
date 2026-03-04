@@ -7,15 +7,68 @@ import tempfile
 from functools import partial
 from typing import Optional
 
-from telegram import InputFile, Message, Update
+from telegram import File, InputFile, Message, Update
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes
+from telegram.error import NetworkError, TimedOut
 
 from services.stt_service import STTService
 from services.llm_service import LLMService
 from services.transcript_formatter import format_html, md_to_telegram_html
 
 logger = logging.getLogger(__name__)
+
+
+async def _download_with_retry(
+    tg_file: File,
+    tmp_path: str,
+    max_retries: int = 3,
+    timeout: float = 180,  # 3 minutes per attempt (reduced to fit within global timeout)
+    status_msg: Optional[Message] = None,
+) -> bool:
+    """Download Telegram file with retry logic and exponential backoff.
+
+    Args:
+        tg_file: Telegram File object
+        tmp_path: Destination path for download
+        max_retries: Maximum number of retry attempts
+        timeout: Timeout in seconds for each download attempt
+        status_msg: Optional status message to update during retries
+
+    Returns:
+        True if download successful, False otherwise
+    """
+    for attempt in range(max_retries):
+        try:
+            if status_msg and attempt > 0:
+                try:
+                    await status_msg.edit_text(
+                        f"⏳ Đang tải file âm thanh (lần thử {attempt + 1}/{max_retries})..."
+                    )
+                except Exception:
+                    pass  # Status update is not critical, continue download
+            await asyncio.wait_for(tg_file.download_to_drive(tmp_path), timeout=timeout)
+            logger.info("Download successful on attempt %d/%d", attempt + 1, max_retries)
+            return True
+        except (NetworkError, TimedOut, asyncio.TimeoutError) as exc:
+            wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+            logger.warning(
+                "Download attempt %d/%d failed: %s. Retrying in %ds...",
+                attempt + 1,
+                max_retries,
+                exc,
+                wait_time,
+            )
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error("Download failed after %d attempts", max_retries)
+                return False
+        except Exception as exc:
+            # Non-retryable errors (file too large, invalid file_id, etc.)
+            logger.error("Non-retryable download error: %s", exc, exc_info=True)
+            return False
+    return False
 
 
 def make_handler(stt: STTService, llm: LLMService, group_name: str):
@@ -59,12 +112,29 @@ async def _handle_audio(
     tmp_path: Optional[str] = None
 
     try:
-        # Download audio to a temporary file (hard 5-minute timeout)
+        # Download audio to a temporary file with retry logic
         tg_file = await context.bot.get_file(audio.file_id)
         suffix = _get_suffix(message)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = tmp.name
-        await asyncio.wait_for(tg_file.download_to_drive(tmp_path), timeout=300)
+
+        # Use retry logic for robust download handling
+        download_success = await _download_with_retry(
+            tg_file, tmp_path, max_retries=3, timeout=180, status_msg=status_msg
+        )
+        if not download_success:
+            try:
+                await status_msg.edit_text(
+                    "❌ Không thể tải file âm thanh sau 3 lần thử.\n"
+                    "📱 Vui lòng:\n"
+                    "1. Kiểm tra kết nối WiFi/4G\n"
+                    "2. Thử gửi lại file sau vài phút\n"
+                    "3. Nếu file >10MB, hãy nén lại"
+                )
+            except Exception as e:
+                logger.warning("Failed to update status message: %s", e)
+            return
+
         logger.info("Downloaded audio to %s (suffix=%s)", tmp_path, suffix)
 
         # Step 1 – Speech-to-text
@@ -97,11 +167,46 @@ async def _handle_audio(
         for chunk in _split_text(summary_html):
             await message.reply_text(chunk, parse_mode="HTML")
 
-        await status_msg.delete()
+        # Clean up status message (may fail if user already deleted it)
+        try:
+            await status_msg.delete()
+        except Exception as e:
+            logger.debug("Status message already deleted or failed: %s", e)
 
+    except NetworkError as exc:
+        logger.error("Network error processing audio: %s", exc, exc_info=True)
+        try:
+            await status_msg.edit_text(
+                "❌ Lỗi kết nối mạng. Vui lòng kiểm tra kết nối internet và thử lại."
+            )
+        except Exception as e:
+            logger.warning("Failed to update status message: %s", e)
+    except TimedOut as exc:
+        logger.error("Timeout processing audio: %s", exc, exc_info=True)
+        try:
+            await status_msg.edit_text(
+                "❌ Quá thời gian xử lý. File có thể quá lớn hoặc mạng chậm."
+            )
+        except Exception as e:
+            logger.warning("Failed to update status message: %s", e)
+    except asyncio.TimeoutError:
+        logger.error("Async timeout processing audio")
+        try:
+            await status_msg.edit_text(
+                "❌ Quá thời gian xử lý (timeout). Vui lòng thử lại với file nhỏ hơn."
+            )
+        except Exception as e:
+            logger.warning("Failed to update status message: %s", e)
     except Exception as exc:
-        logger.error("Error processing audio message: %s", exc, exc_info=True)
-        await status_msg.edit_text(f"❌ Lỗi xử lý: {exc}")
+        logger.error("Unexpected error processing audio message: %s", exc, exc_info=True)
+        error_type = type(exc).__name__
+        try:
+            await status_msg.edit_text(
+                f"❌ Lỗi xử lý: {error_type}\n"
+                "Vui lòng thử lại hoặc liên hệ quản trị viên nếu lỗi tiếp tục xảy ra."
+            )
+        except Exception as e:
+            logger.warning("Failed to update status message: %s", e)
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
